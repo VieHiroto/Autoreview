@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Google API 口コミ返信生成（Gemini 2.0対応）
 // @namespace    http://tampermonkey.net/
-// @version      2.2
-// @description  最新のGemini 2.0 APIを使用した口コミ返信生成
+// @version      2.3
+// @description  最新のGemini APIを使用した口コミ返信生成
 // @author       You
 // @match        *://salonboard.com/CLP/bt/review/reviewReply*
 // @grant        GM_xmlhttpRequest
@@ -14,6 +14,14 @@
 
     let isProcessing = false;
     let countdownInterval = null;
+
+    const API_KEY = "AIzaSyBqx4BeOSoOQaQstipuLWv9HY1gCNdNKQs";
+    const PRIMARY_MODEL = "gemini-flash-latest";
+    const FALLBACK_MODEL = "gemini-1.5-flash-latest";
+
+    function getEndpoint(model) {
+        return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+    }
 
     function addExecuteButton() {
         const existingButton = document.querySelector("#generateReplyButton");
@@ -100,19 +108,8 @@
         return `ニックネーム: ${nickname}, 口コミ内容: ${reviewContent}, 雰囲気: ${reviewScores["雰囲気"] || "なし"}, 技術・仕上がり: ${reviewScores["技術・仕上がり"] || "なし"}, 接客サービス: ${reviewScores["接客サービス"] || "なし"}, メニュー・料金: ${reviewScores["メニュー・料金"] || "なし"}, 総合満足度: ${reviewScores["総合満足度"] || "なし"}`;
     }
 
-    function callAPI(reviewData, retryCount = 0) {
-        const apiKey = "AIzaSyBqx4BeOSoOQaQstipuLWv9HY1gCNdNKQs";
-
-        // Gemini 2.0 Flash を使用（最新モデル）
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`;
-
-        console.log(`API呼び出し（試行 ${retryCount + 1}回目）`);
-        console.log("使用モデル: gemini-2.0-flash-exp");
-
-        const requestBody = {
-            contents: [{
-                parts: [{
-                    text: `あなたは美容サロンのスタッフです。お客様からの口コミに対して、親しみやすい敬語で誠意を持って返信を行ってください。絵文字の使用を禁止します。感嘆符のみで感情の表現をしてください。また的後な改行を挟んでください。
+    function buildPrompt(reviewData) {
+        return `あなたは美容サロンのスタッフです。お客様からの口コミに対して、親しみやすい敬語で誠意を持って返信を行ってください。絵文字の使用を禁止します。感嘆符のみで感情の表現をしてください。また適度な改行を挟んでください。
 
 以下の情報を元に、口コミ返信文を作成してください。
 
@@ -130,7 +127,46 @@ ${reviewData}
 - 150文字程度で簡潔に
 - 返信文のみを出力（説明や前置きは不要）
 - 丁寧だけどカジュアルな口調で
-- 絵文字は使わない`
+- 絵文字は使わない`;
+    }
+
+    function applyReply(reply) {
+        const replyTextarea = document.querySelector("#replyContents");
+        if (replyTextarea) {
+            replyTextarea.value = reply;
+            console.log("✓ 返信を入力しました");
+        } else {
+            console.warn("⚠ #replyContents が見つかりません");
+        }
+
+        const replyFromInput = document.querySelector("#replyFrom");
+        if (replyFromInput) {
+            const stylistName = getStylistName();
+            replyFromInput.value = stylistName;
+            console.log(`✓ 担当者名 "${stylistName}" を入力しました`);
+        } else {
+            console.warn("⚠ #replyFrom が見つかりません");
+        }
+
+        updateStatus("✓ 生成完了！", "green");
+        isProcessing = false;
+
+        setTimeout(() => {
+            const statusLabel = document.querySelector("#replyStatus");
+            if (statusLabel) statusLabel.style.display = "none";
+        }, 3000);
+    }
+
+    function callAPI(reviewData, model, retryCount = 0) {
+        const endpoint = getEndpoint(model);
+
+        console.log(`API呼び出し（試行 ${retryCount + 1}回目）`);
+        console.log("使用モデル:", model);
+
+        const requestBody = {
+            contents: [{
+                parts: [{
+                    text: buildPrompt(reviewData)
                 }]
             }],
             generationConfig: {
@@ -144,7 +180,10 @@ ${reviewData}
         GM_xmlhttpRequest({
             method: "POST",
             url: endpoint,
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "X-goog-api-key": API_KEY
+            },
             data: JSON.stringify(requestBody),
             onload: function(response) {
                 console.log("APIレスポンス:", response.status, response.statusText);
@@ -164,18 +203,19 @@ ${reviewData}
                             console.log(`レート制限。${waitTime}秒待機します...`);
                             startCountdown(waitTime, () => {
                                 updateStatus("再試行中...", "blue");
-                                callAPI(reviewData, retryCount + 1);
+                                callAPI(reviewData, model, retryCount + 1);
                             });
                             return;
                         }
                         throw new Error("レート制限: 1〜2分後に再度お試しください");
                     }
 
-                    // モデルが見つからないエラーの場合は代替モデルを試す
+                    // モデルが見つからないエラーの場合はフォールバック
                     if (data.error?.message?.includes("not found") || data.error?.message?.includes("not supported")) {
-                        if (retryCount === 0) {
-                            console.log("gemini-2.0が使えないため、gemini-1.5-flashで再試行します");
-                            callAPIWithFallback(reviewData);
+                        if (model === PRIMARY_MODEL) {
+                            console.log(`${PRIMARY_MODEL}が使えないため、${FALLBACK_MODEL}で再試行します`);
+                            updateStatus("代替モデルで再試行中...", "blue");
+                            callAPI(reviewData, FALLBACK_MODEL, 0);
                             return;
                         }
                     }
@@ -195,32 +235,7 @@ ${reviewData}
                     const reply = data.candidates[0].content.parts[0].text.trim();
                     console.log("✓ 生成された返信:", reply);
 
-                    // 返信を入力欄に設定
-                    const replyTextarea = document.querySelector("#replyContents");
-                    if (replyTextarea) {
-                        replyTextarea.value = reply;
-                        console.log("✓ 返信を入力しました");
-                    } else {
-                        console.warn("⚠ #replyContents が見つかりません");
-                    }
-
-                    // スタイリスト名を設定
-                    const replyFromInput = document.querySelector("#replyFrom");
-                    if (replyFromInput) {
-                        const stylistName = getStylistName();
-                        replyFromInput.value = stylistName;
-                        console.log(`✓ 担当者名 "${stylistName}" を入力しました`);
-                    } else {
-                        console.warn("⚠ #replyFrom が見つかりません");
-                    }
-
-                    updateStatus("✓ 生成完了！", "green");
-                    isProcessing = false;
-
-                    setTimeout(() => {
-                        const statusLabel = document.querySelector("#replyStatus");
-                        if (statusLabel) statusLabel.style.display = "none";
-                    }, 3000);
+                    applyReply(reply);
 
                 } catch (error) {
                     console.error("❌ エラー:", error.message);
@@ -241,64 +256,6 @@ ${reviewData}
         });
     }
 
-    // フォールバック: Gemini 1.5 Flashを使用
-    function callAPIWithFallback(reviewData) {
-        const apiKey = "AIzaSyBqx4BeOSoOQaQstipuLWv9HY1gCNdNKQs";
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
-
-        console.log("フォールバック: gemini-1.5-flash-latestを使用");
-
-        const requestBody = {
-            contents: [{
-                parts: [{
-                    text: `あなたは美容サロンのスタッフです。お客様からの口コミに対して、親しみやすい敬語で誠意を持って返信を行ってください。絵文字の使用を禁止します。\n\n以下の情報を元に、口コミ返信文を作成してください。\n\n【入力情報】${reviewData}\n\n【返信ルール】\n1. **お礼を述べる**\n2. **口コミの内容に共感する**\n3. **褒められた点を強調する**\n4. **改善点について前向きに対応を伝える**\n5. **次回の来店を促す**\n6. **締めの挨拶を記載**\n\n出力は口コミ内容のみにしてください。`}]
-            }],
-            generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: 200
-            }
-        };
-
-        GM_xmlhttpRequest({
-            method: "POST",
-            url: endpoint,
-            headers: { "Content-Type": "application/json" },
-            data: JSON.stringify(requestBody),
-            onload: function(response) {
-                try {
-                    const data = JSON.parse(response.responseText);
-
-                    if (data.error) {
-                        throw new Error(data.error.message);
-                    }
-
-                    const reply = data.candidates[0].content.parts[0].text.trim();
-
-                    const replyTextarea = document.querySelector("#replyContents");
-                    if (replyTextarea) replyTextarea.value = reply;
-
-                    const replyFromInput = document.querySelector("#replyFrom");
-                    if (replyFromInput) replyFromInput.value = getStylistName();
-
-                    updateStatus("✓ 生成完了！", "green");
-                    isProcessing = false;
-
-                    setTimeout(() => {
-                        document.querySelector("#replyStatus").style.display = "none";
-                    }, 3000);
-
-                } catch (error) {
-                    updateStatus(`エラー: ${error.message}`, "red");
-                    isProcessing = false;
-                }
-            },
-            onerror: function() {
-                updateStatus("通信エラー", "red");
-                isProcessing = false;
-            }
-        });
-    }
-
     function generateReplyUsingAPI() {
         if (isProcessing) {
             console.log("既に処理中です");
@@ -312,11 +269,11 @@ ${reviewData}
         const reviewData = getReviewData();
         console.log("口コミデータ取得完了");
 
-        callAPI(reviewData, 0);
+        callAPI(reviewData, PRIMARY_MODEL, 0);
     }
 
     // スクリプト初期化
-    console.log("✓ 口コミ返信生成スクリプト起動（v2.2 - Gemini 2.0対応）");
+    console.log("✓ 口コミ返信生成スクリプト起動（v2.3 - Gemini API修正版）");
     addExecuteButton();
     console.log("✓ ボタンを追加しました");
 })();
